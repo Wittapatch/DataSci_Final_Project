@@ -273,7 +273,7 @@ def load_df(db_path="scopus.db"):
     # Subjects
     df["_subjects_list"] = df["categories"].apply(categories_to_subjects)
 
-    # --- MODIFIED: Add datetime column for monthly grouping ---
+    # --- Add datetime column for monthly grouping ---
     df["publication_date_dt"] = pd.to_datetime(df["publication_date"], format='%d/%m/%Y', errors='coerce')
 
     return df
@@ -361,7 +361,7 @@ with c4:
 
 st.divider()
 
-# --- MODIFIED: Publication Trends (per Month) ---
+# --- Publication Trends (per Month) ---
 st.subheader("Publication Trends")
 
 # Chart: Papers per Month (with cumulative)
@@ -485,30 +485,28 @@ st.plotly_chart(
 
 st.divider()
 
-# --- MODIFIED: Subject & Keyword Charts (Horizontal Bar) ---
+# --- MODIFIED: Subject & Keyword Charts ---
 st.subheader("Subjects & Keywords")
 
 c1, c2 = st.columns(2)
 
 with c1:
-    # Bar Chart: Top Subjects
+    # MODIFIED: Pie Chart: Top Subjects
     if not dff_subjects_long.empty:
-        subject_counts_df = dff_subjects_long["_subjects_list"].value_counts().head(10).reset_index()
-        subject_counts_df.columns = ["subject", "count"]
-        
-        fig_bar_subject = px.bar(
-            subject_counts_df.sort_values("count"), # Sort ascending for Plotly horizontal bar
-            x="count",
-            y="subject",
-            orientation='h',
+        subject_counts = dff_subjects_long["_subjects_list"].value_counts()
+        fig_pie_subject = px.pie(
+            subject_counts.head(10),
+            values=subject_counts.head(10).values,
+            names=subject_counts.head(10).index,
             title="Top 10 Subjects"
         )
-        st.plotly_chart(fig_bar_subject, use_container_width=True)
+        fig_pie_subject.update_traces(textposition='inside', textinfo='percent+label')
+        st.plotly_chart(fig_pie_subject, use_container_width=True)
     else:
         st.write("No subject data to display.")
 
 with c2:
-    # Bar Chart: Top Keywords
+    # Bar Chart: Top Keywords (Unchanged)
     if not dff_kw_long.empty:
         top_kw = dff_kw_long["_keywords_list"].value_counts().head(20).reset_index()
         top_kw.columns = ["keyword", "count"]
