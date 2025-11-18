@@ -1,3 +1,5 @@
+# scopus_dashboard.py
+
 import sqlite3
 import json
 from collections import Counter
@@ -13,8 +15,14 @@ import networkx as nx
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 
+# ------------------------------------------------------------
+# Streamlit config
+# ------------------------------------------------------------
 st.set_page_config(page_title="Scopus Dashboard", layout="wide")
 
+# ------------------------------------------------------------
+# SQL query
+# ------------------------------------------------------------
 SQL = r"""
 WITH base AS (
   SELECT
@@ -448,8 +456,9 @@ def plot_query_keyword_network(freq, pair_counts, query, top_n=30):
     return fig
 
 
-
-# Load data
+# ------------------------------------------------------------
+# Load data with loading spinner
+# ------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_df(db_path="scopus.db"):
     con = sqlite3.connect(db_path)
@@ -468,40 +477,34 @@ def load_df(db_path="scopus.db"):
 with st.spinner("Loading Scopus data..."):
     df = load_df()
 
+# ------------------------------------------------------------
 # Pre-processing
+# ------------------------------------------------------------
 df = df.copy()
+df["pub_date_dt"] = pd.to_datetime(
+    df["publication_date"], format="%d/%m/%Y", errors="coerce"
+)
 df["_keywords_list"] = df["keywords"].apply(parse_json_list)
 df["_subjects_list"] = df["categories"].apply(categories_to_subjects)
 df["_funding_list"] = df["funding"].apply(parse_json_list)
 df["_papers"] = 1
 
-# Sidebars
+# ------------------------------------------------------------
+# Sidebar filters
+# ------------------------------------------------------------
 st.sidebar.header("Filters")
 
 years = sorted(df["year"].dropna().unique().astype(int))
 year_sel = st.sidebar.multiselect("Year", years, default=years)
-
-kw_search = st.sidebar.text_input(
-    "Search in title / abstract / keywords", value=""
-).strip()
 
 mask = pd.Series(True, index=df.index)
 
 if year_sel:
     mask &= df["year"].isin(year_sel)
 
-if kw_search:
-    q = kw_search.lower()
-    in_title = df["citation_title"].fillna("").str.lower().str.contains(q)
-    in_abs = df["abstracts"].fillna("").str.lower().str.contains(q)
-    in_kw = df["_keywords_list"].apply(
-        lambda lst: any(q in str(x).lower() for x in lst)
-    )
-    mask &= in_title | in_abs | in_kw
-
 dff = df.loc[mask].copy()
 
-st.title("📚 Scopus Literature Dashboard")
+st.title("Scopus Literature Dashboard")
 
 if dff.empty:
     st.warning("No rows match current filters. Try selecting different years or query.")
@@ -513,8 +516,9 @@ dff["citedby_num"] = pd.to_numeric(dff["citedbycount"], errors="coerce")
 dff["funding_count"] = pd.to_numeric(dff["funding_count"], errors="coerce")
 dff["authors_count"] = pd.to_numeric(dff["authors_count"], errors="coerce")
 
-
-# Columns for the key metrics
+# ------------------------------------------------------------
+# KPI cards
+# ------------------------------------------------------------
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("Number of papers", len(dff))
@@ -527,7 +531,9 @@ with c4:
 
 st.markdown("---")
 
-# Literature count
+# ------------------------------------------------------------
+# Literature count (with in-chart toggle)
+# ------------------------------------------------------------
 st.subheader("Literature Count over Time")
 
 mode = st.radio(
@@ -543,23 +549,28 @@ papers_per_year = (
 
 if mode == "Cumulative":
     papers_per_year["paper_count"] = papers_per_year["paper_count"].cumsum()
-    title = "Cumulative Literature Count per Year"
+    title_lit = "Cumulative Literature Count per Year"
 else:
-    title = "Literature Count per Year"
+    title_lit = "Literature Count per Year"
 
 fig_lit = px.line(
     papers_per_year,
     x="year",
     y="paper_count",
     markers=True,
-    title=title,
+    title=title_lit,
+    color_discrete_sequence=["#7695FF"],
 )
 fig_lit.update_layout(xaxis=dict(dtick=1))
+fig_lit.update_traces(line=dict(width=3))
+fig_lit.update_yaxes(rangemode="tozero")
 st.plotly_chart(fig_lit, use_container_width=True)
 
 st.markdown("---")
 
+# ------------------------------------------------------------
 # Normalized references per year
+# ------------------------------------------------------------
 st.subheader("Normalized Number of References per Year")
 
 denom = dff["authors_count"].fillna(0) + dff["funding_count"].fillna(0)
@@ -578,14 +589,22 @@ fig_norm = px.line(
     x="year",
     y="avg_normalized_refs",
     markers=True,
-    title="Average References Normalized by (Authors + Funders)",
+    title="Average Normalized References per Year",
+    color_discrete_sequence=["#7695FF"],
 )
 fig_norm.update_layout(xaxis=dict(dtick=1))
+fig_norm.update_traces(line=dict(width=3))
+fig_norm.update_yaxes(rangemode="tozero")
 st.plotly_chart(fig_norm, use_container_width=True)
+st.caption(
+    "Normalization formula: references divided by (authors + funders) per paper, then averaged per year."
+)
 
 st.markdown("---")
 
+# ------------------------------------------------------------
 # Subject Area metrics (Keywords / Papers / References)
+# ------------------------------------------------------------
 st.subheader("Subject Area Metrics")
 
 sub_df = dff[["year", "_subjects_list", "_keywords_list", "refcount_num"]].explode(
@@ -621,13 +640,14 @@ else:
     )
     y_label = "Total references"
 
-agg = agg.sort_values("value", ascending=False)
+agg = agg.sort_values("value", ascending=False).head(20)
 
 fig_subj = px.bar(
     agg,
     x="subject",
     y="value",
     title=f"{metric_choice}",
+    color_discrete_sequence=["#FF9874"],
 )
 fig_subj.update_layout(
     xaxis_tickangle=-45,
@@ -638,7 +658,9 @@ st.plotly_chart(fig_subj, use_container_width=True)
 
 st.markdown("---")
 
+# ------------------------------------------------------------
 # Funded Papers by Different Affiliations (funding agencies)
+# ------------------------------------------------------------
 st.subheader("Funded Papers by Different Affiliations (Funding Agencies)")
 
 funded = dff[dff["funding_count"] > 0].copy()
@@ -662,6 +684,7 @@ else:
         x="_funding_list",
         y="funded_papers",
         title="Funded Papers by Funding Agencies (Top 20)",
+        color_discrete_sequence=["#FF9874"],
     )
     fig_fund_aff.update_layout(
         xaxis_tickangle=-45,
@@ -672,7 +695,9 @@ else:
 
 st.markdown("---")
 
+# ------------------------------------------------------------
 # Funded Subject Areas by Chulalongkorn University
+# ------------------------------------------------------------
 st.subheader("Funded Subject Areas by Chulalongkorn University")
 
 mask_chula = dff["_funding_list"].apply(
@@ -693,6 +718,7 @@ else:
         .sum()
         .reset_index(name="funded_papers")
         .sort_values("funded_papers", ascending=False)
+        .head(20)
     )
 
     fig_chula = px.bar(
@@ -700,6 +726,7 @@ else:
         x="subject",
         y="funded_papers",
         title="Funded Subject Areas (Chulalongkorn University)",
+        color_discrete_sequence=["#FF9874"],
     )
     fig_chula.update_layout(
         xaxis_tickangle=-45,
@@ -710,8 +737,9 @@ else:
 
 st.markdown("---")
 
-
-# Cited-by count of each paper (top 30)
+# ------------------------------------------------------------
+# Cited-by count of each paper (top 30) – horizontal bars
+# ------------------------------------------------------------
 st.subheader("Top Cited Papers")
 
 top_n_cited = st.slider("Number of top papers", 5, 50, 30, key="top_cited_n")
@@ -731,42 +759,50 @@ top_cited["title_short"] = np.where(
 
 fig_cited = px.bar(
     top_cited,
-    x="title_short",
-    y="citedby_num",
+    x="citedby_num",
+    y="title_short",
+    orientation="h",
     title=f"Top {top_n_cited} Papers by Cited-by Count",
+    color_discrete_sequence=["#FF9874"],
 )
 fig_cited.update_layout(
-    xaxis_tickangle=-45,
-    xaxis_title="Paper title (truncated)",
-    yaxis_title="Cited-by count",
+    xaxis_title="Cited-by count",
+    yaxis_title="Paper title (truncated)",
     showlegend=False,
+    yaxis=dict(categoryorder="total ascending"),
 )
 st.plotly_chart(fig_cited, use_container_width=True)
 
 st.markdown("---")
 
-# Line chart: most popular keywords for last 6 years
-st.subheader("Most Popular Keywords in the Last 6 Years")
-
+# ------------------------------------------------------------
+# Line chart: most popular keywords for recent years
+# ------------------------------------------------------------
 if dff["year"].notna().sum() == 0:
+    st.subheader("Most Popular Keywords (by Year Range)")
     st.info("No year data available.")
 else:
-    max_year = int(dff["year"].max())
-    start_6 = max_year - 5
-    recent = dff[dff["year"] >= start_6].copy()
+    years_avail = sorted(set(int(y) for y in dff["year"].dropna()))
+    # use up to the latest 6 years that remain after filtering
+    recent_years = years_avail[-6:] if len(years_avail) > 6 else years_avail
+    n_years = len(recent_years)
+    start_y, end_y = recent_years[0], recent_years[-1]
+
+    st.subheader(f"Most Popular Keywords in the Last {n_years} Years ({start_y}–{end_y})")
+
+    recent = dff[dff["year"].isin(recent_years)].copy()
 
     if recent.empty:
-        st.info("No rows in the last 6 years for current filters.")
+        st.info("No rows in the selected year range for current filters.")
     else:
-        kw_recent = recent[["year", "_keywords_list"]].explode("_keywords_list")
+        kw_recent = recent[["year", "pub_date_dt", "_keywords_list"]].explode("_keywords_list")
         kw_recent = kw_recent.rename(columns={"_keywords_list": "keyword"})
-        kw_recent = kw_recent[
-            kw_recent["keyword"].notna() & (kw_recent["keyword"] != "")
-        ]
+        kw_recent = kw_recent[kw_recent["keyword"].notna() & (kw_recent["keyword"] != "")]
 
         if kw_recent.empty:
-            st.info("No keywords in the last 6 years for current filters.")
+            st.info("No keywords in the selected year range for current filters.")
         else:
+            # -------- choose top K keywords (used everywhere below) --------
             num_kw = st.slider(
                 "Number of top keywords to plot",
                 3,
@@ -775,66 +811,183 @@ else:
                 key="kw_line_n",
             )
 
-            top_keywords = (
-                kw_recent["keyword"].value_counts().head(num_kw).index.tolist()
-            )
+            top_keywords = kw_recent["keyword"].value_counts().head(num_kw).index.tolist()
             kw_recent = kw_recent[kw_recent["keyword"].isin(top_keywords)]
-
-            counts = (
-                kw_recent.groupby(["year", "keyword"])
-                .size()
-                .reset_index(name="count")
-                .sort_values(["keyword", "year"])
-            )
 
             kw_mode = st.radio(
                 "Display mode",
-                ["Yearly", "Cumulative"],
+                ["Yearly", "Cumulative", "Per month"],
                 horizontal=True,
                 key="kw_mode",
             )
 
-            if kw_mode == "Cumulative":
-                counts["value"] = counts.groupby("keyword")["count"].cumsum()
-                ycol = "value"
-                title_kw = f"Top Keywords in Last 6 Years (Cumulative)"
+            # ---------- aggregate counts depending on mode ----------
+            if kw_mode == "Per month":
+                month_df = kw_recent.dropna(subset=["pub_date_dt"]).copy()
+                if month_df.empty:
+                    st.info("No publication dates available for monthly view.")
+                    st.markdown("---")
+                else:
+                    month_df["month"] = (
+                        month_df["pub_date_dt"].dt.to_period("M").dt.to_timestamp()
+                    )
+                    counts = (
+                        month_df.groupby(["month", "keyword"])
+                        .size()
+                        .reset_index(name="value")
+                        .sort_values(["keyword", "month"])
+                    )
+                    x_col = "month"
+                    title_kw = f"Top Keywords from {start_y} to {end_y} (Per Month)"
             else:
-                counts["value"] = counts["count"]
-                ycol = "value"
-                title_kw = f"Top Keywords in Last 6 Years (Yearly)"
+                counts = (
+                    kw_recent.groupby(["year", "keyword"])
+                    .size()
+                    .reset_index(name="count")
+                    .sort_values(["keyword", "year"])
+                )
 
-            fig_kw_line = px.line(
-                counts,
-                x="year",
-                y=ycol,
-                color="keyword",
-                markers=True,
-                title=title_kw,
-            )
-            fig_kw_line.update_layout(xaxis=dict(dtick=1))
-            st.plotly_chart(fig_kw_line, use_container_width=True)
+                if counts.empty:
+                    st.info("No keyword counts for yearly view.")
+                    st.markdown("---")
+                else:
+                    if kw_mode == "Cumulative":
+                        counts["value"] = counts.groupby("keyword")["count"].cumsum()
+                        title_kw = f"Top Keywords from {start_y} to {end_y} (Cumulative Yearly)"
+                    else:
+                        counts["value"] = counts["count"]
+                        title_kw = f"Top Keywords from {start_y} to {end_y} (Yearly)"
+
+                    x_col = "year"
+
+            if "counts" in locals() and not counts.empty:
+                # ---------- static line chart (main one) ----------
+                fig_kw_line = px.line(
+                    counts,
+                    x=x_col,
+                    y="value",
+                    color="keyword",
+                    markers=True,
+                    title=title_kw,
+                )
+                fig_kw_line.update_traces(line=dict(width=3))
+                if x_col == "year":
+                    fig_kw_line.update_layout(xaxis=dict(dtick=1))
+
+                st.plotly_chart(fig_kw_line, use_container_width=True)
+
+                # ---------- grab color map from static fig ----------
+                keyword_colors = {}
+                for tr in fig_kw_line.data:
+                    name = getattr(tr, "name", None)
+                    if not name:
+                        continue
+                    col = None
+                    # prefer line color
+                    if hasattr(tr, "line") and getattr(tr.line, "color", None) is not None:
+                        col = tr.line.color
+                    # fallback to marker color
+                    elif hasattr(tr, "marker") and getattr(tr.marker, "color", None) is not None:
+                        col = tr.marker.color
+                    if col is not None:
+                        keyword_colors[name] = col
+
+                # ---------- smooth animated version (same K keywords + colors) ----------
+                if kw_mode == "Per month":
+                    # make a full grid of all months × top_keywords (fill missing with 0)
+                    all_periods = sorted(counts["month"].unique())
+                    full_idx = pd.MultiIndex.from_product(
+                        [all_periods, top_keywords],
+                        names=["month", "keyword"],
+                    )
+                    full_df = full_idx.to_frame(index=False)
+                    full_df = full_df.merge(
+                        counts[["month", "keyword", "value"]],
+                        on=["month", "keyword"],
+                        how="left",
+                    )
+                    full_df["value"] = full_df["value"].fillna(0)
+
+                    # build frames progressively over months
+                    anim_frames = []
+                    for frame_idx, m in enumerate(all_periods):
+                        partial = full_df[full_df["month"] <= m].copy()
+                        partial["frame"] = frame_idx
+                        anim_frames.append(partial)
+
+                    anim_df = pd.concat(anim_frames, ignore_index=True)
+
+                    fig_kw_anim = px.line(
+                        anim_df,
+                        x="month",
+                        y="value",
+                        color="keyword",
+                        animation_frame="frame",
+                        animation_group="keyword",
+                        range_y=[0, max(1, full_df["value"].max() * 1.05)],
+                        title=f"Top Keywords from {start_y} to {end_y} (Per Month, Animated)",
+                        color_discrete_map=keyword_colors,
+                    )
+                    fig_kw_anim.update_traces(line=dict(width=3))
+
+                else:
+                    # yearly / cumulative animation
+                    all_years = sorted(recent_years)
+                    full_idx = pd.MultiIndex.from_product(
+                        [all_years, top_keywords],
+                        names=["year", "keyword"],
+                    )
+                    full_df = full_idx.to_frame(index=False)
+                    full_df = full_df.merge(
+                        counts[["year", "keyword", "value"]],
+                        on=["year", "keyword"],
+                        how="left",
+                    )
+                    full_df["value"] = full_df["value"].fillna(0)
+
+                    anim_frames = []
+                    for frame_idx, yr in enumerate(all_years):
+                        partial = full_df[full_df["year"] <= yr].copy()
+                        partial["frame"] = frame_idx
+                        anim_frames.append(partial)
+
+                    anim_df = pd.concat(anim_frames, ignore_index=True)
+
+                    fig_kw_anim = px.line(
+                        anim_df,
+                        x="year",
+                        y="value",
+                        color="keyword",
+                        animation_frame="frame",
+                        animation_group="keyword",
+                        range_y=[0, max(1, full_df["value"].max() * 1.05)],
+                        title=f"Top Keywords from {start_y} to {end_y} ({kw_mode}) (Animated)",
+                        color_discrete_map=keyword_colors,
+                    )
+                    fig_kw_anim.update_traces(line=dict(width=3))
+                    fig_kw_anim.update_layout(xaxis=dict(dtick=1))
+
+                # smooth / slow-ish animation
+                frame_ms = 500        # time each frame is shown (ms)
+                transition_ms = 1000  # movement between frames (ms)
+
+                if fig_kw_anim.layout.updatemenus:
+                    for um in fig_kw_anim.layout.updatemenus:
+                        for btn in um.buttons:
+                            if isinstance(btn.args, (list, tuple)) and len(btn.args) > 1:
+                                if isinstance(btn.args[1], dict) and "frame" in btn.args[1]:
+                                    btn.args[1]["frame"]["duration"] = frame_ms
+                                    btn.args[1]["frame"]["redraw"] = False
+                                    btn.args[1]["transition"]["duration"] = transition_ms
+                                    btn.args[1]["transition"]["easing"] = "linear"
+
+                st.plotly_chart(fig_kw_anim, use_container_width=True)
 
 st.markdown("---")
 
-# Word cloud for subject areas
-st.subheader("Word Cloud of Subject Areas")
-
-all_subjects = [s for lst in dff["_subjects_list"] for s in lst]
-if all_subjects:
-    text = " ".join(all_subjects)
-    wc = WordCloud(width=900, height=400, background_color="white").generate(text)
-    fig_wc, ax_wc = plt.subplots(figsize=(9, 4))
-    ax_wc.imshow(wc, interpolation="bilinear")
-    ax_wc.axis("off")
-    st.pyplot(fig_wc)
-else:
-    st.info("No subject areas available for current filters.")
-
-st.markdown("---")
-
-
+# ------------------------------------------------------------
 # Keyword network graphs
-st.subheader("Keyword Networks")
+# ------------------------------------------------------------
 
 freq, pair_counts = build_keyword_network(dff["_keywords_list"])
 
@@ -853,12 +1006,12 @@ else:
     st.markdown("---")
 
     # Network for an input keyword
-    st.markdown("### Network Graph of Closest Keywords of an Input Keyword")
+    st.markdown("### Network Graph Keywords Relationships")
 
     all_kw_sorted = sorted(freq.keys(), key=lambda k: (-freq[k], k.lower()))
     default_kw = all_kw_sorted[0] if all_kw_sorted else ""
     query_kw = st.text_input("Enter keyword…", value=default_kw)
-    top_related = st.slider("Top N related tags", 5, 50, 30, key="rel_kw_n")
+    top_related = st.slider("Set number of related tags", 5, 50, 30, key="rel_kw_n")
 
     if query_kw:
         fig_query = plot_query_keyword_network(
@@ -871,8 +1024,9 @@ else:
 
 st.markdown("---")
 
-
+# ------------------------------------------------------------
 # Data preview
+# ------------------------------------------------------------
 st.subheader("Filtered rows (preview)")
 
 show_cols = [
