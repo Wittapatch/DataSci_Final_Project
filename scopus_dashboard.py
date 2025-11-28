@@ -1,8 +1,7 @@
-# scopus_dashboard.py
-
 import sqlite3
 import json
 from collections import Counter
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -12,276 +11,24 @@ import plotly.express as px
 import plotly.graph_objects as go
 import networkx as nx
 
-from wordcloud import WordCloud
 import matplotlib.pyplot as plt
+from aimodel2 import run_models_page
+from eda import run_eda_page
 
-# ------------------------------------------------------------
-# Streamlit config
-# ------------------------------------------------------------
 st.set_page_config(page_title="Scopus Dashboard", layout="wide")
 
-# ------------------------------------------------------------
-# SQL query
-# ------------------------------------------------------------
-SQL = r"""
-WITH base AS (
-  SELECT
-    file_id,
-    year,
+st.sidebar.title("Navigation")
+page_choice = st.sidebar.radio("Go to", ("Dashboard", "EDA", "Models"), index=0)
 
-    -- basics
-    json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head."citation-title"') AS citation_title,
-    json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head.abstracts')        AS abstracts,
-    json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head.source.publisher.publishername') AS publishername,
-    json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head.source.sourcetitle')             AS sourcetitle,
+if page_choice == "EDA":
+    run_eda_page()
+    st.stop()
 
-    /* publication_date: DD/MM/YYYY */
-    CASE
-      WHEN json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head.source.publicationdate.day')   IS NOT NULL
-       AND json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head.source.publicationdate.month') IS NOT NULL
-       AND json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head.source.publicationdate.year')  IS NOT NULL
-      THEN printf('%02d/%02d/%04d',
-                  CAST(json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head.source.publicationdate.day')   AS INTEGER),
-                  CAST(json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head.source.publicationdate.month') AS INTEGER),
-                  CAST(json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head.source.publicationdate.year')  AS INTEGER))
-      ELSE NULL
-    END AS publication_date,
+if page_choice == "Models":
+    run_models_page()
+    st.stop()
 
-    /* ce:doi -> document_classification_codes */
-    COALESCE(
-      json_extract(raw_json,'$."abstracts-retrieval-response".item."item-info"."itemidlist"."ce:doi"'),
-      (SELECT t.value
-       FROM json_tree(raw_json, '$."abstracts-retrieval-response"') AS t
-       WHERE t.key = 'ce:doi'
-       LIMIT 1)
-    ) AS document_classification_codes,
-
-    -- counts
-    json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.tail.bibliography."@refcount"') AS refcount,
-    CAST(
-      COALESCE(
-        json_extract(raw_json,'$."abstracts-retrieval-response".coredata."citedby-count"'),
-        json_extract(raw_json,'$."abstracts-retrieval-response".item.coredata."citedby-count"'),
-        (SELECT t.value
-         FROM json_tree(raw_json, '$."abstracts-retrieval-response"') AS t
-         WHERE t.key = 'citedby-count'
-         LIMIT 1)
-      ) AS INTEGER
-    ) AS citedbycount,
-
-    /* authors -> JSON array of "<given> <surname>" */
-    (
-      SELECT COALESCE(json_group_array(name_str), json_array())
-      FROM (
-        SELECT
-          TRIM(
-            TRIM(COALESCE(json_extract(a.value,'$."preferred-name"."ce:given-name"'),
-                          json_extract(a.value,'$."ce:given-name"'), ''))
-            || ' ' ||
-            TRIM(COALESCE(json_extract(a.value,'$."preferred-name"."ce:surname"'),
-                          json_extract(a.value,'$."ce:surname"'), ''))
-          ) AS name_str
-        FROM json_each(
-               CASE json_type(json_extract(raw_json,'$."abstracts-retrieval-response".authors.author'))
-                 WHEN 'array'  THEN json_extract(raw_json,'$."abstracts-retrieval-response".authors.author')
-                 WHEN 'object' THEN json_array(json_extract(raw_json,'$."abstracts-retrieval-response".authors.author'))
-                 ELSE json_array()
-               END
-             ) AS a
-        WHERE TRIM(
-                COALESCE(json_extract(a.value,'$."preferred-name"."ce:given-name"'),
-                         json_extract(a.value,'$."ce:given-name"'), '') || ' ' ||
-                COALESCE(json_extract(a.value,'$."preferred-name"."ce:surname"'),
-                         json_extract(a.value,'$."ce:surname"'), '')
-              ) <> ''
-      )
-    ) AS authors,
-
-    /* categories (subject → abbrev) */
-    (
-      SELECT json_group_array(json_object(subject, abbrev))
-      FROM (
-        SELECT DISTINCT
-          json_extract(sa.value,'$."$"')        AS subject,
-          json_extract(sa.value,'$."@abbrev"')  AS abbrev
-        FROM (
-          SELECT * FROM json_each(
-            CASE json_type(json_extract(raw_json,'$."abstracts-retrieval-response"."subject-areas"."subject-area"'))
-              WHEN 'array'  THEN json_extract(raw_json,'$."abstracts-retrieval-response"."subject-areas"."subject-area"')
-              WHEN 'object' THEN json_array(json_extract(raw_json,'$."abstracts-retrieval-response"."subject-areas"."subject-area"'))
-              ELSE json_array()
-            END
-          )
-          UNION ALL
-          SELECT * FROM json_each(
-            CASE json_type(json_extract(raw_json,'$."abstracts-retrieval-response".item.coredata."subject-areas"."subject-area"'))
-              WHEN 'array'  THEN json_extract(raw_json,'$."abstracts-retrieval-response".item.coredata."subject-areas"."subject-area"')
-              WHEN 'object' THEN json_array(json_extract(raw_json,'$."abstracts-retrieval-response".item.coredata."subject-areas"."subject-area"'))
-              ELSE json_array()
-            END
-          )
-          UNION ALL
-          SELECT * FROM json_each(
-            CASE json_type(json_extract(raw_json,'$."abstracts-retrieval-response".coredata."subject-areas"."subject-area"'))
-              WHEN 'array'  THEN json_extract(raw_json,'$."abstracts-retrieval-response".coredata."subject-areas"."subject-area"')
-              WHEN 'object' THEN json_array(json_extract(raw_json,'$."abstracts-retrieval-response".coredata."subject-areas"."subject-area"'))
-              ELSE json_array()
-            END
-          )
-        ) AS sa
-        WHERE subject IS NOT NULL AND abbrev IS NOT NULL
-      )
-    ) AS categories,
-
-    /* creator = "<given> <surname>" */
-    (
-      SELECT name_full
-      FROM (
-        SELECT TRIM(
-                 COALESCE(json_extract(a.value,'$."preferred-name"."ce:given-name"'),
-                          json_extract(a.value,'$."ce:given-name"'), '') || ' ' ||
-                 COALESCE(json_extract(a.value,'$."preferred-name"."ce:surname"'),
-                          json_extract(a.value,'$."ce:surname"'), '')
-               ) AS name_full
-        FROM (
-          SELECT * FROM json_each(
-            CASE json_type(json_extract(raw_json,'$."abstracts-retrieval-response".item.coredata."dc:creator".author'))
-              WHEN 'array'  THEN json_extract(raw_json,'$."abstracts-retrieval-response".item.coredata."dc:creator".author')
-              WHEN 'object' THEN json_array(json_extract(raw_json,'$."abstracts-retrieval-response".item.coredata."dc:creator".author'))
-              ELSE json_array()
-            END
-          )
-          UNION ALL
-          SELECT * FROM json_each(
-            CASE json_type(json_extract(raw_json,'$."abstracts-retrieval-response".coredata."dc:creator".author'))
-              WHEN 'array'  THEN json_extract(raw_json,'$."abstracts-retrieval-response".coredata."dc:creator".author')
-              WHEN 'object' THEN json_array(json_extract(raw_json,'$."abstracts-retrieval-response".coredata."dc:creator".author'))
-              ELSE json_array()
-            END
-          )
-        ) AS a
-        WHERE name_full <> ''
-        LIMIT 1
-      )
-    ) AS creator,
-
-    /* keywords */
-    (
-      SELECT json_group_array(kw_src.kw)
-      FROM (
-        SELECT json_extract(k.value,'$."$"') AS kw
-        FROM json_each(
-          CASE json_type(json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head."citation-info"."author-keywords"."author-keyword"'))
-            WHEN 'array'  THEN json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head."citation-info"."author-keywords"."author-keyword"')
-            WHEN 'object' THEN json_array(json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.head."citation-info"."author-keywords"."author-keyword"'))
-            ELSE json_array()
-          END
-        ) AS k
-        UNION ALL
-        SELECT json_extract(k2.value,'$."$"') AS kw
-        FROM json_each(
-          CASE json_type(json_extract(raw_json,'$."abstracts-retrieval-response"."authkeywords"."author-keyword"'))
-            WHEN 'array'  THEN json_extract(raw_json,'$."abstracts-retrieval-response"."authkeywords"."author-keyword"')
-            WHEN 'object' THEN json_array(json_extract(raw_json,'$."abstracts-retrieval-response"."authkeywords"."author-keyword"'))
-            ELSE json_array()
-          END
-        ) AS k2
-      ) AS kw_src
-      WHERE kw_src.kw IS NOT NULL
-    ) AS keywords,
-
-    /* funding (array of agency names) */
-    COALESCE((
-      SELECT json_group_array(f_src.name)
-      FROM (
-        SELECT json_extract(f.value, '$."xocs:funding-agency-matched-string"') AS name
-        FROM json_each(
-          CASE json_type(json_extract(raw_json,
-            '$."abstracts-retrieval-response".item."xocs:meta"."xocs:funding-list"."xocs:funding"'))
-            WHEN 'array'  THEN json_extract(raw_json,
-              '$."abstracts-retrieval-response".item."xocs:meta"."xocs:funding-list"."xocs:funding"')
-            WHEN 'object' THEN json_array(json_extract(raw_json,
-              '$."abstracts-retrieval-response".item."xocs:meta"."xocs:funding-list"."xocs:funding"'))
-            ELSE json_array()
-          END
-        ) AS f
-        UNION ALL
-        SELECT json_extract(f2.value, '$."xocs:funding-agency-matched-string"')
-        FROM json_each(
-          CASE json_type(json_extract(raw_json,
-            '$."abstracts-retrieval-response"."xocs:meta"."xocs:funding-list"."xocs:funding"'))
-            WHEN 'array'  THEN json_extract(raw_json,
-              '$."abstracts-retrieval-response"."xocs:meta"."xocs:funding-list"."xocs:funding"')
-            WHEN 'object' THEN json_array(json_extract(raw_json,
-              '$."abstracts-retrieval-response"."xocs:meta"."xocs:funding-list"."xocs:funding"'))
-            ELSE json_array()
-          END
-        ) AS f2
-        UNION ALL
-        SELECT json_extract(f3.value, '$."xocs:funding-agency-matched-string"')
-        FROM json_each(
-          CASE json_type(json_extract(raw_json,
-            '$."abstracts-retrieval-response"."xocs:funding-list"."xocs:funding"'))
-            WHEN 'array'  THEN json_extract(raw_json,
-              '$."abstracts-retrieval-response"."xocs:funding-list"."xocs:funding"')
-            WHEN 'object' THEN json_array(json_extract(raw_json,
-              '$."abstracts-retrieval-response"."xocs:funding-list"."xocs:funding"'))
-            ELSE json_array()
-          END
-        ) AS f3
-        UNION ALL
-        SELECT json_extract(f4.value, '$."xocs:funding-agency-matched-string"')
-        FROM json_each(
-          CASE json_type(json_extract(raw_json,
-            '$."abstracts-retrieval-response".coredata."xocs:funding-list"."xocs:funding"'))
-            WHEN 'array'  THEN json_extract(raw_json,
-              '$."abstracts-retrieval-response".coredata."xocs:funding-list"."xocs:funding"')
-            WHEN 'object' THEN json_array(json_extract(raw_json,
-              '$."abstracts-retrieval-response".coredata."xocs:funding-list"."xocs:funding"'))
-            ELSE json_array()
-          END
-        ) AS f4
-      ) AS f_src
-      WHERE f_src.name IS NOT NULL AND TRIM(f_src.name) <> ''
-    ), json_array()) AS funding,
-
-    /* ref_list: JSON array of ref-titletext */
-    (
-      SELECT COALESCE(json_group_array(title), json_array())
-      FROM (
-        SELECT
-          NULLIF(TRIM(
-            COALESCE(
-              json_extract(r.value,'$."ref-info"."ref-title"."ref-titletext"'),
-              json_extract(r.value,'$."ref-info"."ref-titletext"'),
-              json_extract(r.value,'$."ref-title"."ref-titletext"'),
-              json_extract(r.value,'$."ref-titletext"')
-            )
-          ), '') AS title
-        FROM json_each(
-          CASE json_type(json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.tail.bibliography.reference'))
-            WHEN 'array'  THEN json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.tail.bibliography.reference')
-            WHEN 'object' THEN json_array(json_extract(raw_json,'$."abstracts-retrieval-response".item.bibrecord.tail.bibliography.reference'))
-            ELSE json_array()
-          END
-        ) AS r
-      )
-      WHERE title IS NOT NULL
-    ) AS ref_list
-
-  FROM papers_raw
-)
-SELECT
-  base.*,
-  COALESCE(json_array_length(base.funding), 0) AS funding_count,
-  COALESCE(json_array_length(base.authors), 0) AS authors_count
-FROM base
-ORDER BY year, file_id;
-"""
-
-# ------------------------------------------------------------
 # Helpers
-# ------------------------------------------------------------
 def parse_json_list(s):
     if pd.isna(s):
         return []
@@ -292,14 +39,6 @@ def parse_json_list(s):
         return v if isinstance(v, list) else []
     except Exception:
         return []
-
-
-def categories_to_subjects(cat_str):
-    subjects = []
-    for item in parse_json_list(cat_str):
-        if isinstance(item, dict) and item:
-            subjects.extend(list(item.keys()))
-    return subjects
 
 
 def build_keyword_network(keyword_lists):
@@ -332,7 +71,8 @@ def plot_top_keyword_network(freq, pair_counts, top_n=25, min_coocc=2):
     pos = nx.spring_layout(G, k=0.6, iterations=60, seed=42)
 
     edge_x, edge_y = [], []
-    for a, b in G.edges():
+    for edge in G.edges():
+        a, b = edge[:2]
         x0, y0 = pos[a]
         x1, y1 = pos[b]
         edge_x += [x0, x1, None]
@@ -409,7 +149,8 @@ def plot_query_keyword_network(freq, pair_counts, query, top_n=30):
     pos = nx.spring_layout(G, k=0.9, iterations=60, seed=42)
 
     edge_x, edge_y = [], []
-    for a, b in G.edges():
+    for edge in G.edges():
+        a, b = edge[:2]
         x0, y0 = pos[a]
         x1, y1 = pos[b]
         edge_x += [x0, x1, None]
@@ -456,16 +197,11 @@ def plot_query_keyword_network(freq, pair_counts, query, top_n=30):
     return fig
 
 
-# ------------------------------------------------------------
-# Load data with loading spinner
-# ------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_df(db_path="scopus.db"):
-    con = sqlite3.connect(db_path)
-    try:
-        df = pd.read_sql_query(SQL, con)
-    finally:
-        con.close()
+# Load data
+@st.cache_data(show_spinner="Loading Scopus data …")
+def load_data(db_path="scopus.db"):
+    with sqlite3.connect(db_path) as con:
+        df = pd.read_sql_query("SELECT * FROM research_papers", con)
 
     df["year"] = pd.to_numeric(df["year"], errors="coerce")
     for col in ["refcount", "citedbycount", "funding_count", "authors_count"]:
@@ -475,23 +211,26 @@ def load_df(db_path="scopus.db"):
 
 
 with st.spinner("Loading Scopus data..."):
-    df = load_df()
+    df = load_data()
 
-# ------------------------------------------------------------
 # Pre-processing
-# ------------------------------------------------------------
 df = df.copy()
 df["pub_date_dt"] = pd.to_datetime(
     df["publication_date"], format="%d/%m/%Y", errors="coerce"
 )
 df["_keywords_list"] = df["keywords"].apply(parse_json_list)
-df["_subjects_list"] = df["categories"].apply(categories_to_subjects)
+df["_subjects_list"] = df["categories"].apply(
+    lambda cat: [
+        subject
+        for item in parse_json_list(cat)
+        if isinstance(item, dict) and item
+        for subject in item.keys()
+    ]
+)
 df["_funding_list"] = df["funding"].apply(parse_json_list)
 df["_papers"] = 1
 
-# ------------------------------------------------------------
 # Sidebar filters
-# ------------------------------------------------------------
 st.sidebar.header("Filters")
 
 years = sorted(df["year"].dropna().unique().astype(int))
@@ -516,9 +255,7 @@ dff["citedby_num"] = pd.to_numeric(dff["citedbycount"], errors="coerce")
 dff["funding_count"] = pd.to_numeric(dff["funding_count"], errors="coerce")
 dff["authors_count"] = pd.to_numeric(dff["authors_count"], errors="coerce")
 
-# ------------------------------------------------------------
 # KPI cards
-# ------------------------------------------------------------
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("Number of papers", len(dff))
@@ -531,9 +268,7 @@ with c4:
 
 st.markdown("---")
 
-# ------------------------------------------------------------
 # Literature count (with in-chart toggle)
-# ------------------------------------------------------------
 st.subheader("Literature Count over Time")
 
 mode = st.radio(
@@ -568,9 +303,7 @@ st.plotly_chart(fig_lit, use_container_width=True)
 
 st.markdown("---")
 
-# ------------------------------------------------------------
 # Normalized references per year
-# ------------------------------------------------------------
 st.subheader("Normalized Number of References per Year")
 
 denom = dff["authors_count"].fillna(0) + dff["funding_count"].fillna(0)
@@ -602,9 +335,7 @@ st.caption(
 
 st.markdown("---")
 
-# ------------------------------------------------------------
 # Subject Area metrics (Keywords / Papers / References)
-# ------------------------------------------------------------
 st.subheader("Subject Area Metrics")
 
 sub_df = dff[["year", "_subjects_list", "_keywords_list", "refcount_num"]].explode(
@@ -658,9 +389,7 @@ st.plotly_chart(fig_subj, use_container_width=True)
 
 st.markdown("---")
 
-# ------------------------------------------------------------
 # Funded Papers by Different Affiliations (funding agencies)
-# ------------------------------------------------------------
 st.subheader("Funded Papers by Different Affiliations (Funding Agencies)")
 
 funded = dff[dff["funding_count"] > 0].copy()
@@ -695,9 +424,7 @@ else:
 
 st.markdown("---")
 
-# ------------------------------------------------------------
 # Funded Subject Areas by Chulalongkorn University
-# ------------------------------------------------------------
 st.subheader("Funded Subject Areas by Chulalongkorn University")
 
 mask_chula = dff["_funding_list"].apply(
@@ -737,9 +464,7 @@ else:
 
 st.markdown("---")
 
-# ------------------------------------------------------------
 # Cited-by count of each paper (top 30) – horizontal bars
-# ------------------------------------------------------------
 st.subheader("Top Cited Papers")
 
 top_n_cited = st.slider("Number of top papers", 5, 50, 30, key="top_cited_n")
@@ -775,9 +500,7 @@ st.plotly_chart(fig_cited, use_container_width=True)
 
 st.markdown("---")
 
-# ------------------------------------------------------------
 # Line chart: most popular keywords for recent years
-# ------------------------------------------------------------
 if dff["year"].notna().sum() == 0:
     st.subheader("Most Popular Keywords (by Year Range)")
     st.info("No year data available.")
@@ -802,7 +525,6 @@ else:
         if kw_recent.empty:
             st.info("No keywords in the selected year range for current filters.")
         else:
-            # -------- choose top K keywords (used everywhere below) --------
             num_kw = st.slider(
                 "Number of top keywords to plot",
                 3,
@@ -821,7 +543,10 @@ else:
                 key="kw_mode",
             )
 
-            # ---------- aggregate counts depending on mode ----------
+            counts: Optional[pd.DataFrame] = None
+            x_col: Optional[str] = None
+            title_kw = ""
+
             if kw_mode == "Per month":
                 month_df = kw_recent.dropna(subset=["pub_date_dt"]).copy()
                 if month_df.empty:
@@ -840,28 +565,28 @@ else:
                     x_col = "month"
                     title_kw = f"Top Keywords from {start_y} to {end_y} (Per Month)"
             else:
-                counts = (
+                year_counts = (
                     kw_recent.groupby(["year", "keyword"])
                     .size()
                     .reset_index(name="count")
                     .sort_values(["keyword", "year"])
                 )
 
-                if counts.empty:
+                if year_counts.empty:
                     st.info("No keyword counts for yearly view.")
                     st.markdown("---")
                 else:
                     if kw_mode == "Cumulative":
-                        counts["value"] = counts.groupby("keyword")["count"].cumsum()
+                        year_counts["value"] = year_counts.groupby("keyword")["count"].cumsum()
                         title_kw = f"Top Keywords from {start_y} to {end_y} (Cumulative Yearly)"
                     else:
-                        counts["value"] = counts["count"]
+                        year_counts["value"] = year_counts["count"]
                         title_kw = f"Top Keywords from {start_y} to {end_y} (Yearly)"
 
+                    counts = year_counts
                     x_col = "year"
 
-            if "counts" in locals() and not counts.empty:
-                # ---------- static line chart (main one) ----------
+            if counts is not None and x_col is not None and not counts.empty:
                 fig_kw_line = px.line(
                     counts,
                     x=x_col,
@@ -876,25 +601,23 @@ else:
 
                 st.plotly_chart(fig_kw_line, use_container_width=True)
 
-                # ---------- grab color map from static fig ----------
-                keyword_colors = {}
+                keyword_colors: Dict[str, Any] = {}
                 for tr in fig_kw_line.data:
-                    name = getattr(tr, "name", None)
+                    trace: Any = tr
+                    name = getattr(trace, "name", None)
                     if not name:
                         continue
-                    col = None
-                    # prefer line color
-                    if hasattr(tr, "line") and getattr(tr.line, "color", None) is not None:
-                        col = tr.line.color
-                    # fallback to marker color
-                    elif hasattr(tr, "marker") and getattr(tr.marker, "color", None) is not None:
-                        col = tr.marker.color
-                    if col is not None:
-                        keyword_colors[name] = col
+                    color_val = None
+                    if hasattr(trace, "line") and getattr(trace.line, "color", None) is not None:
+                        color_val = trace.line.color
+                    elif hasattr(trace, "marker") and getattr(trace.marker, "color", None) is not None:
+                        color_val = trace.marker.color
+                    if color_val is not None:
+                        keyword_colors[name] = color_val
 
-                # ---------- smooth animated version (same K keywords + colors) ----------
+                fig_kw_anim: Optional[go.Figure] = None
+
                 if kw_mode == "Per month":
-                    # make a full grid of all months × top_keywords (fill missing with 0)
                     all_periods = sorted(counts["month"].unique())
                     full_idx = pd.MultiIndex.from_product(
                         [all_periods, top_keywords],
@@ -908,7 +631,6 @@ else:
                     )
                     full_df["value"] = full_df["value"].fillna(0)
 
-                    # build frames progressively over months
                     anim_frames = []
                     for frame_idx, m in enumerate(all_periods):
                         partial = full_df[full_df["month"] <= m].copy()
@@ -931,7 +653,6 @@ else:
                     fig_kw_anim.update_traces(line=dict(width=3))
 
                 else:
-                    # yearly / cumulative animation
                     all_years = sorted(recent_years)
                     full_idx = pd.MultiIndex.from_product(
                         [all_years, top_keywords],
@@ -967,27 +688,27 @@ else:
                     fig_kw_anim.update_traces(line=dict(width=3))
                     fig_kw_anim.update_layout(xaxis=dict(dtick=1))
 
-                # smooth / slow-ish animation
-                frame_ms = 500        # time each frame is shown (ms)
-                transition_ms = 1000  # movement between frames (ms)
+                if fig_kw_anim is not None:
+                    updatemenus = getattr(fig_kw_anim.layout, "updatemenus", None)
+                    if updatemenus:
+                        frame_ms = 500
+                        transition_ms = 1000
+                        for um in updatemenus:
+                            for btn in um.buttons:
+                                args = getattr(btn, "args", None)
+                                if isinstance(args, (list, tuple)) and len(args) > 1:
+                                    config = args[1]
+                                    if isinstance(config, dict) and "frame" in config:
+                                        config["frame"]["duration"] = frame_ms
+                                        config["frame"]["redraw"] = False
+                                        config["transition"]["duration"] = transition_ms
+                                        config["transition"]["easing"] = "linear"
 
-                if fig_kw_anim.layout.updatemenus:
-                    for um in fig_kw_anim.layout.updatemenus:
-                        for btn in um.buttons:
-                            if isinstance(btn.args, (list, tuple)) and len(btn.args) > 1:
-                                if isinstance(btn.args[1], dict) and "frame" in btn.args[1]:
-                                    btn.args[1]["frame"]["duration"] = frame_ms
-                                    btn.args[1]["frame"]["redraw"] = False
-                                    btn.args[1]["transition"]["duration"] = transition_ms
-                                    btn.args[1]["transition"]["easing"] = "linear"
-
-                st.plotly_chart(fig_kw_anim, use_container_width=True)
+                    st.plotly_chart(fig_kw_anim, use_container_width=True)
 
 st.markdown("---")
 
-# ------------------------------------------------------------
 # Keyword network graphs
-# ------------------------------------------------------------
 
 freq, pair_counts = build_keyword_network(dff["_keywords_list"])
 
@@ -1024,9 +745,7 @@ else:
 
 st.markdown("---")
 
-# ------------------------------------------------------------
 # Data preview
-# ------------------------------------------------------------
 st.subheader("Filtered rows (preview)")
 
 show_cols = [
